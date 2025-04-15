@@ -1,0 +1,1608 @@
+<?php
+include 'config.php';
+
+// Ambil shift aktif terakhir
+$active_shift = $conn->query("SELECT id FROM shift WHERE status = 'Aktif' ORDER BY start_time DESC LIMIT 1");
+if (!$active_shift) {
+    die("Query Error (Shift): " . $conn->error);
+}
+if ($active_shift->num_rows > 0) {
+    $shift_data = $active_shift->fetch_assoc();
+    $shift_id = $shift_data['id'];
+} else {
+    die("<script>alert('Tidak ada shift aktif. Harap buka shift terlebih dahulu.'); window.location.href='shift.php';</script>");
+}
+
+// Ambil daftar barang
+$items = $conn->query("SELECT * FROM items");
+
+// Handle transaksi baru
+if (isset($_POST['submit_transaction'])) {
+    $total_price = floatval($_POST['total_price']);
+    $customer_count = intval($_POST['customer_count']);
+    $selected_items = isset($_POST['items']) && is_array($_POST['items']) ? $_POST['items'] : [];
+
+    if ($customer_count < 1) {
+        die("<script>alert('Masukkan jumlah pelanggan yang valid.');</script>");
+    }
+    if (empty($selected_items)) {
+        die("<script>alert('Pilih minimal 1 barang untuk transaksi.');</script>");
+    }
+
+    // Simpan transaksi ke tabel transactions
+    $stmt = $conn->prepare("INSERT INTO transactions (total_price, customer_count, shift_id, transaction_date, created_at) VALUES (?, ?, ?, NOW(), NOW())");
+    if (!$stmt) {
+        die("Query Error (Insert transactions): " . $conn->error);
+    }
+    if (!$stmt->bind_param("dii", $total_price, $customer_count, $shift_id)) {
+        die("Bind param error: " . $stmt->error);
+    }
+    if (!$stmt->execute()) {
+        die("Execute error (Insert transactions): " . $stmt->error);
+    }
+    $transaction_id = $stmt->insert_id;
+
+    // Proses setiap item yang dipilih
+    foreach ($selected_items as $item_id => $quantity) {
+        $quantity = floatval($quantity);
+        if ($quantity > 0) {
+            $stmt = $conn->prepare("SELECT name, quantity FROM items WHERE id = ?");
+            if (!$stmt) {
+                die("Query Error (Select items): " . $conn->error);
+            }
+            $stmt->bind_param("i", $item_id);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $item = $result->fetch_assoc();
+
+            if ($item && $item['quantity'] >= $quantity) {
+                // Kurangi stok barang
+                $update = $conn->prepare("UPDATE items SET quantity = quantity - ? WHERE id = ?");
+                if (!$update) {
+                    die("Query Error (Update stock): " . $conn->error);
+                }
+                $update->bind_param("di", $quantity, $item_id);
+                if (!$update->execute()) {
+                    die("Execute error (Update stock): " . $update->error);
+                }
+
+                // Simpan ke tabel transaction_items
+                $stmt = $conn->prepare("INSERT INTO transaction_items (transaction_id, item_id, quantity_used) VALUES (?, ?, ?)");
+                if (!$stmt) {
+                    die("Query Error (Insert transaction_items): " . $conn->error);
+                }
+                $stmt->bind_param("iid", $transaction_id, $item_id, $quantity);
+                if (!$stmt->execute()) {
+                    die("Execute error (Insert transaction_items): " . $stmt->error);
+                }
+            } else {
+                echo "<script>alert('Stok tidak cukup untuk item ID $item_id');</script>";
+            }
+        }
+    }
+
+    echo "<script>alert('Transaksi berhasil!'); window.location.href='riwayat_transaksi.php';</script>";
+}
+
+// Ambil ulang data stok
+$items = $conn->query("SELECT * FROM items");
+?>
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transaksi | Kasir Barbershop</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #3a56d4;
+            --primary-hover: #2a46c4;
+            --primary-light: #eef2ff;
+            --secondary: #2b2d42;
+            --accent: #f72585;
+            --success: #4cc9f0;
+            --warning: #ffd166;
+            --danger: #ef476f;
+            --dark: #212529;
+            --light: #f8f9fa;
+            --gray: #6c757d;
+            --gray-light: #e9ecef;
+            --gray-dark: #343a40;
+            --body-bg: #f5f7fc;
+            --card-bg: #ffffff;
+            --card-border: rgba(0, 0, 0, 0.05);
+            --input-bg: #ffffff;
+            --input-border: #dee2e6;
+            --input-focus: rgba(58, 86, 212, 0.25);
+            --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.05);
+            --shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            --shadow-lg: 0 8px 15px rgba(0, 0, 0, 0.08);
+            --radius-sm: 8px;
+            --radius: 12px;
+            --radius-lg: 16px;
+            --font-primary: 'Plus Jakarta Sans', sans-serif;
+            --transition: all 0.2s ease;
+            --z-sidebar: 1030;
+            --z-overlay: 1020;
+            --z-dropdown: 1010;
+            --z-fixed: 1000;
+        }
+
+        /* Base & Reset */
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: var(--font-primary);
+            background-color: var(--body-bg);
+            color: var(--dark);
+            line-height: 1.6;
+            font-size: 0.95rem;
+            overflow-x: hidden;
+        }
+
+        a {
+            text-decoration: none;
+            color: inherit;
+            transition: var(--transition);
+        }
+
+        ul {
+            list-style: none;
+        }
+
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+
+        input, button, textarea, select {
+            font-family: inherit;
+            font-size: inherit;
+        }
+
+        button {
+            cursor: pointer;
+            border: none;
+            outline: none;
+            background: none;
+        }
+
+        /* Typography */
+        h1, h2, h3, h4, h5, h6 {
+            font-weight: 600;
+            line-height: 1.2;
+            color: var(--secondary);
+            margin-bottom: 0.5rem;
+        }
+
+        .text-primary { color: var(--primary) !important; }
+        .text-success { color: var(--success) !important; }
+        .text-warning { color: var(--warning) !important; }
+        .text-danger { color: var(--danger) !important; }
+        .text-dark { color: var(--dark) !important; }
+        .text-muted { color: var(--gray) !important; }
+
+        .fw-light { font-weight: 300 !important; }
+        .fw-normal { font-weight: 400 !important; }
+        .fw-medium { font-weight: 500 !important; }
+        .fw-semibold { font-weight: 600 !important; }
+        .fw-bold { font-weight: 700 !important; }
+
+        .fs-sm { font-size: 0.875rem !important; }
+        .fs-md { font-size: 1rem !important; }
+        .fs-lg { font-size: 1.125rem !important; }
+        .fs-xl { font-size: 1.25rem !important; }
+
+        /* Utils */
+        .d-flex { display: flex !important; }
+        .flex-column { flex-direction: column !important; }
+        .align-items-center { align-items: center !important; }
+        .justify-content-between { justify-content: space-between !important; }
+        .justify-content-center { justify-content: center !important; }
+        .justify-content-end { justify-content: flex-end !important; }
+        .gap-1 { gap: 0.25rem !important; }
+        .gap-2 { gap: 0.5rem !important; }
+        .gap-3 { gap: 1rem !important; }
+        .gap-4 { gap: 1.5rem !important; }
+
+        .mb-0 { margin-bottom: 0 !important; }
+        .mb-1 { margin-bottom: 0.25rem !important; }
+        .mb-2 { margin-bottom: 0.5rem !important; }
+        .mb-3 { margin-bottom: 1rem !important; }
+        .mb-4 { margin-bottom: 1.5rem !important; }
+        .mb-5 { margin-bottom: 3rem !important; }
+
+        .mt-2 { margin-top: 0.5rem !important; }
+        .mt-3 { margin-top: 1rem !important; }
+        .mt-4 { margin-top: 1.5rem !important; }
+        .mt-5 { margin-top: 3rem !important; }
+
+        .p-0 { padding: 0 !important; }
+        .p-3 { padding: 1rem !important; }
+        .p-4 { padding: 1.5rem !important; }
+        .p-5 { padding: 3rem !important; }
+
+        .py-2 { padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; }
+        .py-3 { padding-top: 1rem !important; padding-bottom: 1rem !important; }
+        .px-3 { padding-left: 1rem !important; padding-right: 1rem !important; }
+        .px-4 { padding-left: 1.5rem !important; padding-right: 1.5rem !important; }
+
+        .shadow-sm { box-shadow: var(--shadow-sm) !important; }
+        .shadow { box-shadow: var(--shadow) !important; }
+        .shadow-lg { box-shadow: var(--shadow-lg) !important; }
+
+        .text-center { text-align: center !important; }
+        .text-end { text-align: right !important; }
+
+        .rounded { border-radius: var(--radius) !important; }
+        .rounded-sm { border-radius: var(--radius-sm) !important; }
+        .rounded-lg { border-radius: var(--radius-lg) !important; }
+
+        .overflow-hidden { overflow: hidden !important; }
+        .position-relative { position: relative !important; }
+        .w-100 { width: 100% !important; }
+
+        /* Layout */
+        .app-wrapper {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            height: 100vh;
+            position: fixed;
+            left: 0;
+            top: 0;
+            background: var(--secondary);
+            color: #fff;
+            z-index: var(--z-sidebar);
+            transition: transform 0.3s ease;
+            display: flex;
+            flex-direction: column;
+            box-shadow: var(--shadow-lg);
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+            padding: 0;
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 6px;
+        }
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .sidebar::-webkit-scrollbar-thumb {
+            background-color: rgba(255, 255, 255, 0.2);
+            border-radius: 20px;
+        }
+
+        .sidebar-header {
+            padding: 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .sidebar-logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-weight: 600;
+            font-size: 1.25rem;
+            color: #fff;
+        }
+
+        .sidebar-logo i {
+            font-size: 1.5rem;
+            color: var(--accent);
+        }
+
+        .menu-section {
+            padding: 1.25rem 0;
+        }
+
+        .menu-section-title {
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 0 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .menu-item {
+            padding: 0.75rem 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            color: rgba(255, 255, 255, 0.75);
+            position: relative;
+            transition: var(--transition);
+        }
+
+        .menu-item i {
+            font-size: 1.125rem;
+            min-width: 1.75rem;
+            text-align: center;
+            transition: var(--transition);
+        }
+
+        .menu-item:hover {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .menu-item.active {
+            color: #fff;
+            background: var(--primary);
+        }
+
+        .menu-item.active::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            height: 100%;
+            width: 4px;
+            background: var(--accent);
+        }
+
+        .sidebar-footer {
+            padding: 1rem 1.5rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            margin-top: auto;
+        }
+
+        .sidebar-user {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .sidebar-user-avatar {
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 50%;
+            object-fit: cover;
+            background: var(--primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .sidebar-user-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar-user-name {
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        .sidebar-user-role {
+            font-size: 0.75rem;
+            color: rgba(255, 255, 255, 0.5);
+        }
+
+        /* Content */
+        .content {
+            flex: 1;
+            margin-left: 280px;
+            padding: 2rem;
+            transition: var(--transition);
+        }
+
+        .page-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 2rem;
+            gap: 1rem;
+        }
+
+        .page-title {
+            font-size: 1.75rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            color: var(--secondary);
+            margin-bottom: 0;
+        }
+
+        .page-title i {
+            font-size: 1.25rem;
+            color: var(--primary);
+            background: var(--primary-light);
+            padding: 0.75rem;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .page-actions {
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        /* Breadcrumbs */
+        .breadcrumb {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--gray);
+            margin-bottom: 1.5rem;
+            padding: 0.5rem 1rem;
+            background-color: rgba(255, 255, 255, 0.5);
+            border-radius: var(--radius-sm);
+            backdrop-filter: blur(10px);
+        }
+
+        .breadcrumb-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .breadcrumb-item a {
+            color: var(--primary);
+        }
+
+        .breadcrumb-item a:hover {
+            text-decoration: underline;
+        }
+
+        .breadcrumb-divider {
+            font-size: 0.75rem;
+            color: var(--gray-light);
+        }
+
+        /* Card */
+        .card {
+            background: var(--card-bg);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+            transition: var(--transition);
+            margin-bottom: 2rem;
+            border: none;
+        }
+
+        .card:hover {
+            box-shadow: var(--shadow-lg);
+            transform: translateY(-3px);
+        }
+
+        .card-header {
+            padding: 1.25rem 1.5rem;
+            background: var(--light);
+            border-bottom: 1px solid var(--card-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--secondary);
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .card-title i {
+            color: var(--primary);
+            font-size: 1.125rem;
+        }
+
+        .card-body {
+            padding: 1.5rem;
+        }
+
+        .card-footer {
+            padding: 1.25rem 1.5rem;
+            background: var(--light);
+            border-top: 1px solid var(--card-border);
+        }
+
+        /* Form */
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            color: var(--secondary);
+        }
+
+        .form-text {
+            display: block;
+            margin-top: 0.25rem;
+            font-size: 0.875rem;
+            color: var(--gray);
+        }
+
+        .form-control {
+            display: block;
+            width: 100%;
+            padding: 0.75rem 1rem;
+            font-size: 1rem;
+            line-height: 1.5;
+            color: var(--dark);
+            background-color: var(--input-bg);
+            background-clip: padding-box;
+            border: 1px solid var(--input-border);
+            border-radius: var(--radius-sm);
+            transition: var(--transition);
+        }
+
+        .form-control:focus {
+            color: var(--dark);
+            background-color: var(--input-bg);
+            border-color: var(--primary);
+            outline: 0;
+            box-shadow: 0 0 0 0.25rem var(--input-focus);
+        }
+
+        .form-control.is-invalid {
+            border-color: var(--danger);
+        }
+
+        .form-control.is-valid {
+            border-color: var(--success);
+        }
+
+        /* Input Group */
+        .input-group {
+            position: relative;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: stretch;
+            width: 100%;
+        }
+
+        .input-group-text {
+            display: flex;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            font-size: 1rem;
+            font-weight: 500;
+            line-height: 1.5;
+            text-align: center;
+            white-space: nowrap;
+            background-color: var(--gray-light);
+            border: 1px solid var(--input-border);
+        }
+
+        .input-group-text:first-child {
+            border-top-left-radius: var(--radius-sm);
+            border-bottom-left-radius: var(--radius-sm);
+            border-right: 0;
+        }
+
+        .input-group-text:last-child {
+            border-top-right-radius: var(--radius-sm);
+            border-bottom-right-radius: var(--radius-sm);
+            border-left: 0;
+        }
+
+        .input-group .form-control:not(:first-child) {
+            border-top-left-radius: 0;
+            border-bottom-left-radius: 0;
+        }
+
+        .input-group .form-control:not(:last-child) {
+            border-top-right-radius: 0;
+            border-bottom-right-radius: 0;
+        }
+
+        /* Form Row */
+        .form-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+        }
+
+        .form-row > div {
+            flex: 1;
+            min-width: calc(50% - 0.75rem);
+        }
+
+        /* Button */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            font-weight: 500;
+            line-height: 1.5;
+            color: #fff;
+            text-align: center;
+            text-decoration: none;
+            vertical-align: middle;
+            cursor: pointer;
+            user-select: none;
+            border: 1px solid transparent;
+            border-radius: var(--radius-sm);
+            transition: var(--transition);
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background-color: var(--primary);
+            border-color: var(--primary);
+        }
+
+        .btn-primary:hover, .btn-primary:active {
+            background-color: var(--primary-hover);
+            border-color: var(--primary-hover);
+            transform: translateY(-2px);
+        }
+
+        .btn-lg {
+            padding: 0.875rem 1.75rem;
+            font-size: 1.1rem;
+            border-radius: var(--radius);
+        }
+
+        .btn-sm {
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+            border-radius: var(--radius-sm);
+        }
+
+        /* Table */
+        .table-responsive {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            margin-bottom: 1rem;
+            border-radius: var(--radius-sm);
+            background-color: var(--card-bg);
+            box-shadow: var(--shadow-sm);
+        }
+
+        .table {
+            width: 100%;
+            margin-bottom: 0;
+            color: var(--dark);
+            border-collapse: separate;
+            border-spacing: 0;
+        }
+
+        .table th,
+        .table td {
+            padding: 1rem;
+            vertical-align: middle;
+            border-top: 1px solid var(--gray-light);
+        }
+
+        .table thead th {
+            vertical-align: middle;
+            border-bottom: 2px solid var(--gray-light);
+            background-color: var(--light);
+            color: var(--secondary);
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+        }
+
+        .table tbody tr:last-child td {
+            border-bottom: 1px solid var(--gray-light);
+        }
+
+        .table-hover tbody tr:hover {
+            background-color: rgba(67, 97, 238, 0.05);
+        }
+
+        .table-striped tbody tr:nth-of-type(odd) {
+            background-color: rgba(0, 0, 0, 0.02);
+        }
+
+        .table-sm th,
+        .table-sm td {
+            padding: 0.5rem;
+        }
+
+        /* Status Badges */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.35em 0.65em;
+            font-size: 0.75rem;
+            font-weight: 500;
+            line-height: 1;
+            text-align: center;
+            white-space: nowrap;
+            vertical-align: baseline;
+            border-radius: 20px;
+        }
+
+        .badge-primary {
+            color: #fff;
+            background-color: var(--primary);
+        }
+
+        .badge-success {
+            color: #fff;
+            background-color: var(--success);
+        }
+
+        .badge-warning {
+            color: var(--dark);
+            background-color: var(--warning);
+        }
+
+        .badge-danger {
+            color: #fff;
+            background-color: var(--danger);
+        }
+
+        .badge-secondary {
+            color: #fff;
+            background-color: var(--gray);
+        }
+
+        .badge-outline-success {
+            color: var(--success);
+            background-color: rgba(76, 201, 240, 0.1);
+            border: 1px solid var(--success);
+        }
+
+        .badge-outline-danger {
+            color: var(--danger);
+            background-color: rgba(239, 71, 111, 0.1);
+            border: 1px solid var(--danger);
+        }
+
+        /* Alerts */
+        .alert {
+            position: relative;
+            padding: 1rem 1.25rem;
+            margin-bottom: 1.5rem;
+            border: none;
+            border-radius: var(--radius-sm);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .alert-success {
+            color: #155724;
+            background-color: #d4edda;
+        }
+
+        .alert-danger {
+            color: #721c24;
+            background-color: #f8d7da;
+        }
+
+        .alert-warning {
+            color: #856404;
+            background-color: #fff3cd;
+        }
+
+        .alert-info {
+            color: #0c5460;
+            background-color: #d1ecf1;
+        }
+
+        /* Custom Components */
+        .quantity-control {
+            display: flex;
+            align-items: center;
+            max-width: 140px;
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .quantity-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            background-color: var(--light);
+            border: 1px solid var(--input-border);
+            color: var(--dark);
+            font-size: 14px;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .quantity-btn:hover {
+            background-color: var(--primary-light);
+            color: var(--primary);
+        }
+
+        .quantity-btn:first-child {
+            border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+        }
+
+        .quantity-btn:last-child {
+            border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+        }
+
+        .quantity-input {
+            width: 60px;
+            text-align: center;
+            border-left: 0;
+            border-right: 0;
+            border-radius: 0;
+            padding: 0.375rem 0.5rem;
+            height: 36px;
+        }
+
+        .quantity-input:focus {
+            box-shadow: none;
+            border-color: var(--input-border);
+        }
+
+        /* Item List */
+        .item-list {
+            margin-bottom: 1.5rem;
+        }
+
+        .item-row {
+            padding: 1rem;
+            border-radius: var(--radius-sm);
+            background-color: var(--card-bg);
+            border: 1px solid var(--gray-light);
+            margin-bottom: 0.75rem;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .item-row:hover {
+            border-color: var(--primary);
+            box-shadow: var(--shadow-sm);
+        }
+
+        .item-icon {
+            width: 40px;
+            height: 40px;
+            background-color: var(--primary-light);
+            color: var(--primary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .item-info {
+            flex: 1;
+        }
+
+        .item-title {
+            font-weight: 600;
+            color: var(--secondary);
+            margin-bottom: 0.25rem;
+        }
+
+        .item-meta {
+            font-size: 0.875rem;
+            color: var(--gray);
+        }
+
+        .item-actions {
+            flex-shrink: 0;
+        }
+
+        /* Mobile Toggle Button */
+        .mobile-toggle {
+            display: none;
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            width: 48px;
+            height: 48px;
+            background: var(--primary);
+            color: #fff;
+            border-radius: 50%;
+            z-index: var(--z-fixed);
+            box-shadow: var(--shadow-lg);
+            justify-content: center;
+            align-items: center;
+            font-size: 1.25rem;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 992px) {
+            .sidebar {
+                width: 250px;
+            }
+            .content {
+                margin-left: 250px;
+            }
+            .form-row {
+                flex-wrap: wrap;
+            }
+            .form-row > div {
+                min-width: 100%;
+                margin-bottom: 1rem;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .mobile-toggle {
+                display: flex;
+            }
+            .sidebar {
+                transform: translateX(-100%);
+                width: 280px;
+            }
+            .sidebar.active {
+                transform: translateX(0);
+            }
+            .content {
+                margin-left: 0;
+                padding: 1.5rem 1rem;
+            }
+            .overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.5);
+                z-index: var(--z-overlay);
+                display: none;
+                backdrop-filter: blur(4px);
+            }
+            .overlay.active {
+                display: block;
+            }
+            .page-title {
+                font-size: 1.5rem;
+            }
+            .card-body {
+                padding: 1.25rem 1rem;
+            }
+        }
+
+        @media (max-width: 576px) {
+            .table-responsive {
+                margin: 0 -1rem;
+                width: calc(100% + 2rem);
+            }
+            .page-actions {
+                width: 100%;
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+            .page-actions .btn {
+                width: 100%;
+            }
+            .item-row {
+                flex-wrap: wrap;
+            }
+            .item-actions {
+                width: 100%;
+                margin-top: 1rem;
+                display: flex;
+                justify-content: flex-end;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-wrapper">
+        <!-- Mobile Overlay -->
+        <div class="overlay"></div>
+        
+        <!-- Mobile Toggle Button -->
+        <button class="mobile-toggle">
+            <i class="fas fa-bars"></i>
+        </button>
+        
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <a href="index.php" class="sidebar-logo">
+                    <i class="fas fa-cut"></i>
+                    <span>BarberPOS</span>
+                </a>
+            </div>
+            
+            <div class="menu-section">
+                <h5 class="menu-section-title">Menu Utama</h5>
+                <nav>
+                    <a href="index.php" class="menu-item">
+                        <i class="fas fa-home"></i>
+                        <span>Dashboard</span>
+                    </a>
+                    <a href="transaksi.php" class="menu-item active">
+                        <i class="fas fa-cash-register"></i>
+                        <span>Transaksi</span>
+                    </a>
+                    <a href="shift.php" class="menu-item">
+                        <i class="fas fa-user-clock"></i>
+                        <span>Shift</span>
+                    </a>
+                    <a href="stok.php" class="menu-item">
+                        <i class="fas fa-boxes"></i>
+                        <span>Stok Barang</span>
+                    </a>
+                </nav>
+            </div>
+            
+            <div class="menu-section">
+                <h5 class="menu-section-title">Laporan</h5>
+                <nav>
+                    <a href="riwayat_transaksi.php" class="menu-item">
+                        <i class="fas fa-history"></i>
+                        <span>Riwayat Transaksi</span>
+                    </a>
+                    <a href="laporan.php" class="menu-item">
+    <i class="fas fa-chart-bar"></i>
+    <span>Laporan Keuangan</span>
+</a>
+<a href="statistik.php" class="menu-item">
+    <i class="fas fa-chart-line"></i>
+    <span>Statistik Penjualan</span>
+</a>
+</nav>
+        </div>
+        
+        <div class="menu-section">
+            <h5 class="menu-section-title">Pengaturan</h5>
+            <nav>
+                <a href="layanan.php" class="menu-item">
+                    <i class="fas fa-list-ul"></i>
+                    <span>Layanan & Produk</span>
+                </a>
+                <a href="karyawan.php" class="menu-item">
+                    <i class="fas fa-user-friends"></i>
+                    <span>Karyawan</span>
+                </a>
+                <a href="pengaturan.php" class="menu-item">
+                    <i class="fas fa-cog"></i>
+                    <span>Pengaturan Sistem</span>
+                </a>
+            </nav>
+        </div>
+        
+        <div class="sidebar-footer">
+            <div class="sidebar-user">
+                <div class="sidebar-user-avatar">
+                    <span>AD</span>
+                </div>
+                <div class="sidebar-user-info">
+                    <div class="sidebar-user-name">Admin</div>
+                    <div class="sidebar-user-role">Administrator</div>
+                </div>
+            </div>
+        </div>
+    </aside>
+    
+    <!-- Main Content -->
+    <main class="content">
+        <!-- Breadcrumb -->
+        <div class="breadcrumb">
+            <div class="breadcrumb-item">
+                <a href="index.php"><i class="fas fa-home"></i></a>
+            </div>
+            <div class="breadcrumb-divider">
+                <i class="fas fa-chevron-right"></i>
+            </div>
+            <div class="breadcrumb-item">Transaksi</div>
+        </div>
+        
+        <!-- Page Header -->
+        <div class="page-header">
+            <h1 class="page-title">
+                <i class="fas fa-cash-register"></i>
+                <span>Transaksi Baru</span>
+            </h1>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btnFinishTransaction">
+                    <i class="fas fa-check"></i>
+                    <span>Selesaikan Transaksi</span>
+                </button>
+            </div>
+        </div>
+        
+        <!-- Transaction Form -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-shopping-cart"></i>
+                    <span>Data Transaksi</span>
+                </h2>
+            </div>
+            <div class="card-body">
+                <form id="transactionForm">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="customerName" class="form-label">Nama Pelanggan</label>
+                            <input type="text" class="form-control" id="customerName" placeholder="Masukkan nama pelanggan">
+                            <small class="form-text">Opsional, dapat dikosongkan untuk pelanggan umum</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="barber" class="form-label">Barberman</label>
+                            <select class="form-control" id="barber" required>
+                                <option value="" selected disabled>Pilih Barberman</option>
+                                <option value="1">Aldi</option>
+                                <option value="2">Budi</option>
+                                <option value="3">Candra</option>
+                                <option value="4">Dodi</option>
+                            </select>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+        
+        <!-- Services Selection -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-cut"></i>
+                    <span>Layanan</span>
+                </h2>
+            </div>
+            <div class="card-body">
+                <div class="item-list">
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-cut"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Haircut Regular</h4>
+                            <div class="item-meta">Rp 40.000</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-service" data-id="1" data-name="Haircut Regular" data-price="40000">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-cut"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Haircut + Wash</h4>
+                            <div class="item-meta">Rp 55.000</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-service" data-id="2" data-name="Haircut + Wash" data-price="55000">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-cut"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Haircut + Coloring</h4>
+                            <div class="item-meta">Rp 150.000</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-service" data-id="3" data-name="Haircut + Coloring" data-price="150000">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-spa"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Creambath</h4>
+                            <div class="item-meta">Rp 70.000</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-service" data-id="4" data-name="Creambath" data-price="70000">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-hot-tub"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Hair Spa</h4>
+                            <div class="item-meta">Rp 85.000</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-service" data-id="5" data-name="Hair Spa" data-price="85000">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Products Selection -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-pump-soap"></i>
+                    <span>Produk</span>
+                </h2>
+            </div>
+            <div class="card-body">
+                <div class="item-list">
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-spray-can"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Pomade Premium</h4>
+                            <div class="item-meta">Rp 85.000 | Stok: 24</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-product" data-id="1" data-name="Pomade Premium" data-price="85000" data-stock="24">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-spray-can"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Hair Spray</h4>
+                            <div class="item-meta">Rp 70.000 | Stok: 15</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-product" data-id="2" data-name="Hair Spray" data-price="70000" data-stock="15">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="item-row">
+                        <div class="item-icon">
+                            <i class="fas fa-pump-soap"></i>
+                        </div>
+                        <div class="item-info">
+                            <h4 class="item-title">Shampoo Premium</h4>
+                            <div class="item-meta">Rp 120.000 | Stok: 10</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-primary btn-sm add-product" data-id="3" data-name="Shampoo Premium" data-price="120000" data-stock="10">
+                                <i class="fas fa-plus"></i> Tambah
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Cart -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-shopping-cart"></i>
+                    <span>Keranjang</span>
+                </h2>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th width="5%">#</th>
+                                <th width="35%">Item</th>
+                                <th width="15%">Jenis</th>
+                                <th width="15%">Harga</th>
+                                <th width="15%">Jumlah</th>
+                                <th width="15%">Subtotal</th>
+                                <th width="5%"></th>
+                            </tr>
+                        </thead>
+                        <tbody id="cartItems">
+                            <!-- Cart items will be added dynamically -->
+                            <tr id="emptyCart">
+                                <td colspan="7" class="text-center py-3">Belum ada item, silahkan tambahkan layanan atau produk</td>
+                            </tr>
+                        </tbody>
+                        <tfoot>
+                            <tr>
+                                <td colspan="5" class="text-end fw-bold">Total</td>
+                                <td class="fw-bold" id="cartTotal">Rp 0</td>
+                                <td></td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+            <div class="card-footer">
+                <div class="d-flex justify-content-end">
+                    <button class="btn btn-primary" id="btnPayment">
+                        <i class="fas fa-money-bill-wave"></i>
+                        <span>Proses Pembayaran</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </main>
+    
+    <!-- Payment Modal -->
+    <div class="modal fade" id="paymentModal" tabindex="-1" aria-labelledby="paymentModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="paymentModalLabel">Pembayaran</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- Payment form will be added here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Mobile sidebar toggle
+        document.querySelector('.mobile-toggle').addEventListener('click', function() {
+            document.querySelector('.sidebar').classList.toggle('active');
+            document.querySelector('.overlay').classList.toggle('active');
+        });
+        
+        document.querySelector('.overlay').addEventListener('click', function() {
+            document.querySelector('.sidebar').classList.remove('active');
+            document.querySelector('.overlay').classList.remove('active');
+        });
+        
+        // Cart functionality
+        let cart = [];
+        let itemCounter = 1;
+        
+        // Add service to cart
+        document.querySelectorAll('.add-service').forEach(button => {
+            button.addEventListener('click', function() {
+                const id = this.dataset.id;
+                const name = this.dataset.name;
+                const price = parseInt(this.dataset.price);
+                
+                addToCart({
+                    id: id,
+                    name: name,
+                    price: price,
+                    type: 'Layanan',
+                    quantity: 1
+                });
+            });
+        });
+        
+        // Add product to cart
+        document.querySelectorAll('.add-product').forEach(button => {
+            button.addEventListener('click', function() {
+                const id = this.dataset.id;
+                const name = this.dataset.name;
+                const price = parseInt(this.dataset.price);
+                const stock = parseInt(this.dataset.stock);
+                
+                addToCart({
+                    id: id,
+                    name: name,
+                    price: price,
+                    type: 'Produk',
+                    quantity: 1,
+                    stock: stock
+                });
+            });
+        });
+        
+        // Add item to cart
+        function addToCart(item) {
+            // Check if item already exists in cart
+            const existingItem = cart.find(cartItem => 
+                cartItem.id === item.id && cartItem.type === item.type
+            );
+            
+            if (existingItem) {
+                // Increment quantity if it's a product
+                if (existingItem.type === 'Produk') {
+                    if (existingItem.quantity < existingItem.stock) {
+                        existingItem.quantity++;
+                        updateCartItem(existingItem);
+                    } else {
+                        alert('Stok tidak mencukupi!');
+                    }
+                } else {
+                    // For services, add as new item
+                    item.cartId = itemCounter++;
+                    cart.push(item);
+                    renderCartItem(item);
+                }
+            } else {
+                item.cartId = itemCounter++;
+                cart.push(item);
+                renderCartItem(item);
+            }
+            
+            updateCartTotal();
+            checkEmptyCart();
+        }
+        
+        // Render cart item in the table
+        function renderCartItem(item) {
+            const cartTable = document.getElementById('cartItems');
+            
+            const row = document.createElement('tr');
+            row.dataset.cartId = item.cartId;
+            
+            row.innerHTML = `
+                <td>${item.cartId}</td>
+                <td>${item.name}</td>
+                <td><span class="badge ${item.type === 'Layanan' ? 'badge-primary' : 'badge-success'}">${item.type}</span></td>
+                <td>Rp ${formatNumber(item.price)}</td>
+                <td>
+                    ${item.type === 'Produk' ? 
+                        `<div class="quantity-control">
+                            <button type="button" class="quantity-btn minus" data-cart-id="${item.cartId}">-</button>
+                            <input type="text" class="form-control quantity-input" value="${item.quantity}" readonly>
+                            <button type="button" class="quantity-btn plus" data-cart-id="${item.cartId}">+</button>
+                        </div>` : 
+                        item.quantity
+                    }
+                </td>
+                <td>Rp ${formatNumber(item.price * item.quantity)}</td>
+                <td>
+                    <button type="button" class="btn btn-sm text-danger remove-item" data-cart-id="${item.cartId}">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </td>
+            `;
+            
+            cartTable.appendChild(row);
+            
+            // Add event listeners for quantity buttons
+            if (item.type === 'Produk') {
+                const minusBtn = row.querySelector('.minus');
+                const plusBtn = row.querySelector('.plus');
+                
+                minusBtn.addEventListener('click', function() {
+                    updateItemQuantity(item.cartId, -1);
+                });
+                
+                plusBtn.addEventListener('click', function() {
+                    updateItemQuantity(item.cartId, 1);
+                });
+            }
+            
+            // Add event listener for remove button
+            row.querySelector('.remove-item').addEventListener('click', function() {
+                removeCartItem(item.cartId);
+            });
+        }
+        
+        // Update item quantity
+        function updateItemQuantity(cartId, change) {
+            const item = cart.find(item => item.cartId === cartId);
+            
+            if (item) {
+                if (change > 0 && item.quantity >= item.stock) {
+                    alert('Stok tidak mencukupi!');
+                    return;
+                }
+                
+                if (change < 0 && item.quantity <= 1) {
+                    removeCartItem(cartId);
+                    return;
+                }
+                
+                item.quantity += change;
+                updateCartItem(item);
+                updateCartTotal();
+            }
+        }
+        
+        // Update cart item in the table
+        function updateCartItem(item) {
+            const row = document.querySelector(tr[data-cart-id="${item.cartId}"]);
+            
+            if (row) {
+                const quantityInput = row.querySelector('.quantity-input');
+                if (quantityInput) {
+                    quantityInput.value = item.quantity;
+                }
+                
+                const subtotalCell = row.cells[5];
+                subtotalCell.textContent = Rp ${formatNumber(item.price * item.quantity)};
+            }
+        }
+        
+        // Remove item from cart
+        function removeCartItem(cartId) {
+            cart = cart.filter(item => item.cartId !== cartId);
+            
+            const row = document.querySelector(tr[data-cart-id="${cartId}"]);
+            if (row) {
+                row.remove();
+            }
+            
+            updateCartTotal();
+            checkEmptyCart();
+        }
+        
+        // Update cart total
+        function updateCartTotal() {
+            const total = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+            document.getElementById('cartTotal').textContent = Rp ${formatNumber(total)};
+        }
+        
+        // Check if cart is empty
+        function checkEmptyCart() {
+            const emptyCartRow = document.getElementById('emptyCart');
+            
+            if (cart.length === 0) {
+                if (!emptyCartRow) {
+                    const cartTable = document.getElementById('cartItems');
+                    const row = document.createElement('tr');
+                    row.id = 'emptyCart';
+                    row.innerHTML = '<td colspan="7" class="text-center py-3">Belum ada item, silahkan tambahkan layanan atau produk</td>';
+                    cartTable.appendChild(row);
+                } else {
+                    emptyCartRow.style.display = '';
+                }
+            } else if (emptyCartRow) {
+                emptyCartRow.style.display = 'none';
+            }
+        }
+        
+        // Format number with commas
+        function formatNumber(number) {
+            return number.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+        }
+        
+        // Process payment
+        document.getElementById('btnPayment').addEventListener('click', function() {
+            if (cart.length === 0) {
+                alert('Keranjang masih kosong! Tambahkan item terlebih dahulu.');
+                return;
+            }
+            
+            if (!document.getElementById('barber').value) {
+                alert('Silahkan pilih barberman terlebih dahulu!');
+                document.getElementById('barber').focus();
+                return;
+            }
+            
+            // Here you would show the payment modal
+            // For now, we'll just alert
+            alert('Fitur pembayaran masih dalam pengembangan.');
+        });
+    </script>
+</body>
+</html>

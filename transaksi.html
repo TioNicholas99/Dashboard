@@ -1,0 +1,1203 @@
+<?php
+include 'config.php';
+
+// Get active shift
+$active_shift = $conn->query("SELECT id FROM shift WHERE status = 'Aktif' ORDER BY start_time DESC LIMIT 1");
+if (!$active_shift) {
+    die("Query Error (Shift): " . $conn->error);
+}
+if ($active_shift->num_rows > 0) {
+    $shift_data = $active_shift->fetch_assoc();
+    $shift_id = $shift_data['id'];
+} else {
+    die("<script>alert('Tidak ada shift aktif. Harap buka shift terlebih dahulu.'); window.location.href='shift.php';</script>");
+}
+
+// Get item list
+$items = $conn->query("SELECT * FROM items ORDER BY name ASC");
+
+// Handle new transaction
+if (isset($_POST['submit_transaction'])) {
+    $total_price = floatval($_POST['total_price']);
+    $customer_count = intval($_POST['customer_count']);
+    $customer_name = trim($_POST['customer_name']);
+    $payment_method = $_POST['payment_method'];
+    $selected_items = isset($_POST['items']) && is_array($_POST['items']) ? $_POST['items'] : [];
+    $notes = trim($_POST['notes']);
+
+    if ($customer_count < 1) {
+        echo "<script>alert('Masukkan jumlah pelanggan yang valid.');</script>";
+    } elseif (empty($selected_items) || !array_filter($selected_items)) {
+        echo "<script>alert('Pilih minimal 1 barang untuk transaksi.');</script>";
+    } else {
+        // Begin transaction to ensure data integrity
+        $conn->begin_transaction();
+        
+        try {
+            // Save transaction to transactions table
+            $stmt = $conn->prepare("INSERT INTO transactions (total_price, customer_count, customer_name, payment_method, notes, shift_id, transaction_date, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())");
+            if (!$stmt) {
+                throw new Exception("Query Error (Insert transactions): " . $conn->error);
+            }
+            
+            if (!$stmt->bind_param("disssi", $total_price, $customer_count, $customer_name, $payment_method, $notes, $shift_id)) {
+                throw new Exception("Bind param error: " . $stmt->error);
+            }
+            
+            if (!$stmt->execute()) {
+                throw new Exception("Execute error (Insert transactions): " . $stmt->error);
+            }
+            
+            $transaction_id = $stmt->insert_id;
+            
+            // Process each selected item
+            $insufficient_stock = [];
+            
+            foreach ($selected_items as $item_id => $quantity) {
+                $quantity = floatval($quantity);
+                if ($quantity > 0) {
+                    $stmt = $conn->prepare("SELECT name, quantity FROM items WHERE id = ?");
+                    if (!$stmt) {
+                        throw new Exception("Query Error (Select items): " . $conn->error);
+                    }
+                    
+                    $stmt->bind_param("i", $item_id);
+                    $stmt->execute();
+                    $result = $stmt->get_result();
+                    $item = $result->fetch_assoc();
+                    
+                    if ($item && $item['quantity'] >= $quantity) {
+                        // Reduce item stock
+                        $update = $conn->prepare("UPDATE items SET quantity = quantity - ? WHERE id = ?");
+                        if (!$update) {
+                            throw new Exception("Query Error (Update stock): " . $conn->error);
+                        }
+                        
+                        $update->bind_param("di", $quantity, $item_id);
+                        if (!$update->execute()) {
+                            throw new Exception("Execute error (Update stock): " . $update->error);
+                        }
+                        
+                        // Save to transaction_items table
+                        $stmt = $conn->prepare("INSERT INTO transaction_items (transaction_id, item_id, quantity_used) VALUES (?, ?, ?)");
+                        if (!$stmt) {
+                            throw new Exception("Query Error (Insert transaction_items): " . $conn->error);
+                        }
+                        
+                        $stmt->bind_param("iid", $transaction_id, $item_id, $quantity);
+                        if (!$stmt->execute()) {
+                            throw new Exception("Execute error (Insert transaction_items): " . $stmt->error);
+                        }
+                    } else {
+                        $insufficient_stock[] = $item['name'];
+                    }
+                }
+            }
+            
+            if (!empty($insufficient_stock)) {
+                throw new Exception("Stok tidak cukup untuk: " . implode(", ", $insufficient_stock));
+            }
+            
+            // Commit the transaction if everything is successful
+            $conn->commit();
+            
+            echo "<script>
+                Swal.fire({
+                    icon: 'success',
+                    title: 'Transaksi Berhasil!',
+                    text: 'Transaksi telah disimpan.',
+                    showConfirmButton: true
+                }).then((result) => {
+                    window.location.href='riwayat_transaksi.php';
+                });
+            </script>";
+            
+        } catch (Exception $e) {
+            // Rollback the transaction if any error occurs
+            $conn->rollback();
+            echo "<script>
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Transaksi Gagal',
+                    text: '" . addslashes($e->getMessage()) . "',
+                    showConfirmButton: true
+                });
+            </script>";
+        }
+    }
+}
+
+// Reload item data
+$items = $conn->query("SELECT * FROM items ORDER BY name ASC");
+
+// Group items by category
+$categories = [];
+while ($row = $items->fetch_assoc()) {
+    $category = $row['category'] ?? 'Lainnya';
+    if (!isset($categories[$category])) {
+        $categories[$category] = [];
+    }
+    $categories[$category][] = $row;
+}
+?>
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transaksi - Kasir Barbershop</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <style>
+        /* Global Styles */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Poppins', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        body {
+            background-color: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        /* Sidebar Styles */
+        .sidebar {
+            width: 280px;
+            height: 100vh;
+            position: fixed;
+            background: linear-gradient(135deg, #1a237e, #283593);
+            color: white;
+            padding-top: 20px;
+            box-shadow: 2px 0 15px rgba(0, 0, 0, 0.1);
+            transition: all 0.3s ease;
+            z-index: 1000;
+            overflow-y: auto;
+        }
+
+        .sidebar h2 {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 0 20px;
+            font-weight: 600;
+            font-size: 24px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+            padding-bottom: 15px;
+        }
+
+        .sidebar a {
+            display: flex;
+            align-items: center;
+            color: white;
+            text-decoration: none;
+            padding: 12px 25px;
+            margin: 8px 15px;
+            border-radius: 5px;
+            transition: all 0.2s;
+            font-size: 16px;
+        }
+
+        .sidebar a i {
+            margin-right: 10px;
+            width: 20px;
+            text-align: center;
+        }
+
+        .sidebar a:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateX(5px);
+        }
+
+        .sidebar a.active {
+            background: rgba(255, 255, 255, 0.3);
+            font-weight: 600;
+        }
+
+        /* Content Area */
+        .content {
+            margin-left: 280px;
+            padding: 30px;
+            transition: all 0.3s ease;
+        }
+
+        .content h2 {
+            color: #1a237e;
+            margin-bottom: 20px;
+            font-size: 28px;
+            font-weight: 600;
+            border-bottom: 2px solid #1a237e;
+            padding-bottom: 10px;
+            display: inline-block;
+        }
+
+        .content h3 {
+            color: #283593;
+            margin: 25px 0 15px 0;
+            font-size: 20px;
+            font-weight: 500;
+        }
+
+        /* Transaction Form Layout */
+        .transaction-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+
+        .transaction-info, .product-selection {
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 2px 15px rgba(0, 0, 0, 0.05);
+        }
+
+        /* Form Styles */
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #333;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+            transition: border 0.3s;
+        }
+
+        .form-control:focus {
+            border-color: #1a237e;
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(26, 35, 126, 0.2);
+        }
+
+        .form-row {
+            display: flex;
+            gap: 20px;
+        }
+
+        .form-row .form-group {
+            flex: 1;
+        }
+
+        /* Tabs for Item Categories */
+        .tab-container {
+            margin-bottom: 20px;
+        }
+
+        .tabs {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .tab-btn {
+            padding: 10px 15px;
+            background: #f0f2f5;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.3s;
+        }
+
+        .tab-btn:hover {
+            background: #e6e9ed;
+        }
+
+        .tab-btn.active {
+            background: #1a237e;
+            color: white;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Table Styles */
+        .item-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+        }
+
+        .item-table th, .item-table td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+
+        .item-table th {
+            background-color: #f0f2f5;
+            color: #1a237e;
+            font-weight: 600;
+        }
+
+        .item-table tbody tr:hover {
+            background-color: #f8f9fa;
+        }
+
+        .low-stock {
+            background-color: rgba(255, 82, 82, 0.1);
+        }
+
+        .low-stock td {
+            color: #e53935;
+        }
+
+        .item-quantity {
+            width: 100px;
+            text-align: center;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+
+        /* Button Styles */
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #1a237e, #283593);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            box-shadow: 0 3px 10px rgba(26, 35, 126, 0.2);
+            transition: all 0.3s;
+        }
+
+        .btn:hover {
+            background: linear-gradient(135deg, #283593, #1a237e);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(26, 35, 126, 0.3);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-full {
+            width: 100%;
+            text-align: center;
+        }
+
+        /* Transaction Summary */
+        .transaction-summary {
+            background: #f0f2f5;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+
+        .summary-title {
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #1a237e;
+        }
+
+        .summary-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+        }
+
+        .selected-items-list {
+            max-height: 200px;
+            overflow-y: auto;
+            margin-bottom: 10px;
+        }
+
+        .total-price {
+            font-size: 20px;
+            font-weight: 600;
+            color: #1a237e;
+            margin-top: 10px;
+            text-align: right;
+        }
+
+        /* Search Bar */
+        .search-container {
+            margin-bottom: 20px;
+        }
+
+        .search-box {
+            display: flex;
+        }
+
+        .search-input {
+            flex: 1;
+            padding: 12px 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px 0 0 5px;
+            font-size: 16px;
+        }
+
+        .search-btn {
+            padding: 12px 15px;
+            background: #1a237e;
+            color: white;
+            border: none;
+            border-radius: 0 5px 5px 0;
+            cursor: pointer;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1200px) {
+            .transaction-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 992px) {
+            .sidebar {
+                width: 250px;
+            }
+            .content {
+                margin-left: 250px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                width: 0;
+                transform: translateX(-100%);
+            }
+            .content {
+                margin-left: 0;
+            }
+            .menu-toggle {
+                display: block;
+                position: fixed;
+                top: 20px;
+                left: 20px;
+                z-index: 1001;
+                background: #1a237e;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                width: 45px;
+                height: 45px;
+                text-align: center;
+                line-height: 45px;
+                font-size: 24px;
+                cursor: pointer;
+                box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+            }
+            .sidebar.active {
+                width: 250px;
+                transform: translateX(0);
+            }
+            .form-row {
+                flex-direction: column;
+                gap: 0;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <h2>Kasir Barbershop</h2>
+    <a href="dashboard.php"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
+    <a href="transaksi.php" class="active"><i class="fas fa-cash-register"></i> Transaksi</a>
+    <a href="riwayat_transaksi.php"><i class="fas fa-history"></i> Riwayat Transaksi</a>
+    <a href="stock.php"><i class="fas fa-boxes"></i> Stok Barang</a>
+    <a href="shift.php"><i class="fas fa-calendar-alt"></i> Shift Kerja</a>
+    <a href="laporan.php"><i class="fas fa-chart-bar"></i> Laporan</a>
+    <a href="logout.php"><i class="fas fa-sign-out-alt"></i> Logout</a>
+</div>
+
+<button class="menu-toggle" id="menuToggle" style="display: none;"><i class="fas fa-bars"></i></button>
+
+<div class="content">
+    <h2><i class="fas fa-cash-register"></i> Transaksi Baru</h2>
+    
+    <form method="POST" id="transactionForm">
+        <div class="transaction-container">
+            <!-- Transaction Information -->
+            <div class="transaction-info">
+                <h3>Informasi Transaksi</h3>
+                
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="total_price">Total Harga (Rp)</label>
+                        <input type="number" id="total_price" name="total_price" class="form-control" min="0" step="1000" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label" for="customer_count">Jumlah Pelanggan</label>
+                        <input type="number" id="customer_count" name="customer_count" class="form-control" min="1" value="1" required>
+                    </div>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label" for="customer_name">Nama Pelanggan</label>
+                    <input type="text" id="customer_name" name="customer_name" class="form-control" placeholder="Opsional">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label" for="payment_method">Metode Pembayaran</label>
+                    <select id="payment_method" name="payment_method" class="form-control" required>
+                        <option value="Tunai">Tunai</option>
+                        <option value="Kartu Debit">Kartu Debit</option>
+                        <option value="Kartu Kredit">Kartu Kredit</option>
+                        <option value="QRIS">QRIS</option>
+                        <option value="Transfer Bank">Transfer Bank</option>
+                        <option value="E-Wallet">E-Wallet</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label" for="notes">Catatan Transaksi</label>
+                    <textarea id="notes" name="notes" class="form-control" rows="3" placeholder="Opsional"></textarea>
+                </div>
+                
+                <div class="transaction-summary">
+                    <div class="summary-title">Ringkasan Transaksi</div>
+                    <div class="selected-items-list" id="selectedItemsList">
+                        <div class="summary-item">
+                            <span>Belum ada item yang dipilih</span>
+                        </div>
+                    </div>
+                    <div class="total-price">Total: Rp <span id="displayTotal">0</span></div>
+                </div>
+                
+                <button type="submit" name="submit_transaction" class="btn btn-full">
+                    <i class="fas fa-check-circle"></i> Proses Transaksi
+                </button>
+            </div>
+            
+            <!-- Product Selection -->
+            <div class="product-selection">
+                <h3>Pilih Produk/Layanan</h3>
+                
+                <div class="search-container">
+                    <div class="search-box">
+                        <input type="text" id="searchItem" class="search-input" placeholder="Cari produk atau layanan...">
+                        <button type="button" class="search-btn"><i class="fas fa-search"></i></button>
+                    </div>
+                </div>
+                
+                <div class="tab-container">
+                    <div class="tabs" id="categoryTabs">
+                        <button type="button" class="tab-btn active" data-category="all">Semua</button>
+                        <?php foreach (array_keys($categories) as $category): ?>
+                            <button type="button" class="tab-btn" data-category="<?= htmlspecialchars($category) ?>"><?= htmlspecialchars($category) ?></button>
+                        <?php endforeach; ?>
+                    </div>
+                    
+                    <div class="tab-content active" id="allTab">
+                        <table class="item-table">
+                            <thead>
+                                <tr>
+                                    <th>Nama Produk/Layanan</th>
+                                    <th>Sisa Stok</th>
+                                    <th>Jumlah</th>
+                                </tr>
+                            </thead>
+                            <tbody id="allItemsBody">
+                                <?php 
+                                $items->data_seek(0); // Reset pointer
+                                while ($row = $items->fetch_assoc()): 
+                                ?>
+                                    <tr class="<?= ($row['quantity'] <= 5) ? 'low-stock' : '' ?>" data-search="<?= htmlspecialchars(strtolower($row['name'])) ?>">
+                                        <td><?= htmlspecialchars($row['name']) ?></td>
+                                        <td><?= number_format($row['quantity'], 2) ?></td>
+                                        <td>
+                                            <input type="number" name="items[<?= $row['id'] ?>]" class="item-quantity" 
+                                                   min="0" max="<?= $row['quantity'] ?>" step="0.01" value="0"
+                                                   data-item-id="<?= $row['id'] ?>"
+                                                   data-item-name="<?= htmlspecialchars($row['name']) ?>">
+                                        </td>
+                                    </tr>
+                                <?php endwhile; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <?php foreach ($categories as $category => $items): ?>
+                        <div class="tab-content" id="<?= htmlspecialchars($category) ?>Tab">
+                            <table class="item-table">
+                                <thead>
+                                    <tr>
+                                        <th>Nama Produk/Layanan</th>
+                                        <th>Sisa Stok</th>
+                                        <th>Jumlah</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($items as $row): ?>
+                                        <tr class="<?= ($row['quantity'] <= 5) ? 'low-stock' : '' ?>" data-search="<?= htmlspecialchars(strtolower($row['name'])) ?>">
+                                            <td><?= htmlspecialchars($row['name']) ?></td>
+                                            <td><?= number_format($row['quantity'], 2) ?></td>
+                                            <td>
+                                                <input type="number" name="items[<?= $row['id'] ?>]" class="item-quantity" 
+                                                       min="0" max="<?= $row['quantity'] ?>" step="0.01" value="0"
+                                                       data-item-id="<?= $row['id'] ?>"
+                                                       data-item-name="<?= htmlspecialchars($row['name']) ?>">
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+        </div>
+    </form>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Mobile menu toggle
+        const menuToggle = document.getElementById('menuToggle');
+        const sidebar = document.querySelector('.sidebar');
+        
+        if (window.innerWidth <= 768) {
+            menuToggle.style.display = 'block';
+        }
+        
+        window.addEventListener('resize', function() {
+            if (window.innerWidth <= 768) {
+                menuToggle.style.display = 'block';
+            } else {
+                menuToggle.style.display = 'none';
+                sidebar.classList.add('active');
+            }
+        });
+        
+        if (menuToggle) {
+            menuToggle.addEventListener('click', function() {
+                sidebar.classList.toggle('active');
+            });
+        }
+        
+        // Category tabs
+        const tabButtons = document.querySelectorAll('.tab-btn');
+        const tabContents = document.querySelectorAll('.tab-content');
+        
+        tabButtons.forEach(button => {
+            button.addEventListener('click', () => {
+                const category = button.getAttribute('data-category');
+                
+                // Deactivate all buttons and contents
+                tabButtons.forEach(btn => btn.classList.remove('active'));
+                tabContents.forEach(content => content.classList.remove('active'));
+                
+                // Activate current button
+                button.classList.add('active');
+                
+                // Activate corresponding content
+                if (category === 'all') {
+                    document.getElementById('allTab').classList.add('active');
+                } else {
+                    document.getElementById(`${category}Tab`).classList.add('active');
+                }
+            });
+        });
+        
+        // Search functionality
+        const searchInput = document.getElementById('searchItem');
+        
+        searchInput.addEventListener('input', function() {
+            const searchTerm = this.value.toLowerCase();
+            const allRows = document.querySelectorAll('.item-table tbody tr');
+            
+            allRows.forEach(row => {
+                const searchText = row.getAttribute('data-search');
+                if (searchText.includes(searchTerm)) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+        });
+        
+        // Update transaction summary when quantities change
+        const itemQuantities = document.querySelectorAll('.item-quantity');
+        const selectedItemsList = document.getElementById('selectedItemsList');
+        const displayTotal = document.getElementById('displayTotal');
+        const totalPriceInput = document.getElementById('total_price');
+        
+        itemQuantities.forEach(input => {
+            input.addEventListener('input', updateTransactionSummary);
+        });
+        
+        totalPriceInput.addEventListener('input', function() {
+            const totalPrice = this.value || 0;
+            displayTotal.textContent = new Intl.NumberFormat('id-ID').format(totalPrice);
+        });
+        
+        function updateTransactionSummary() {
+            const selectedItems = [];
+            let anySelected = false;
+            
+            itemQuantities.forEach(input => {
+                const quantity = parseFloat(input.value) || 0;
+                if (quantity > 0) {
+                    anySelected = true;
+                    selectedItems.push({
+                        id: input.getAttribute('data-item-id'),
+                        name: input.getAttribute('data-item-name'),
+                        quantity: quantity
+                    });
+                }
+            });
+            
+            // Update the summary display
+            if (anySelected) {
+                let summaryHTML = '';
+                selectedItems.forEach(item => {
+                    summaryHTML += `<div class="summary-item">
+                        <span>${item.name}</span>
+                        <span>x${item.quantity}</span>
+                    </div>`;
+                });
+                selectedItemsList.innerHTML = summaryHTML;
+            } else {
+                selectedItemsList.innerHTML = '<div class="summary-item"><span>Belum ada item yang dipilih</span></div>';
+            }
+            
+            // Get total price from input
+            const totalPrice = totalPriceInput.value || 0;
+            displayTotal.textContent = new Intl.NumberFormat('id-ID').format(totalPrice);
+        }
+        
+        // Initialize summary
+        updateTransactionSummary();
+        
+        // Form validation
+        document.getElementById('transactionForm').addEventListener('submit', function(event) {
+            const totalPrice = totalPriceInput.value;
+            const customerCount = document.getElementById('customer_count').value;
+            let anyItemSelected = false;
+            
+            itemQuantities.forEach(input => {
+                if (parseFloat(input.value) > 0) {
+                    anyItemSelected = true;
+                }
+            });
+            
+            if (!totalPrice || totalPrice <= 0) {
+                event.preventDefault();
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Validasi Gagal',
+                    text: 'Harap masukkan total harga yang valid.'
+                });
+                return;
+            }
+            
+            if (!customerCount || customerCount < 1) {
+                event.preventDefault();
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Validasi Gagal',
+                    text: 'Jumlah pelanggan minimal 1.'
+                });
+                return;
+            }
+            
+            if (!anyItemSelected) {
+                event.preventDefault();
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Validasi Gagal',
+                    text: 'Pilih minimal 1 produk atau layanan untuk transaksi.'
+                });
+                return;
+            }
+        });
+    });
+</script>
+
+</body>
+</html>
+
+
+
+
+<style>
+    /* Global Styles */
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        font-family: 'Poppins', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+
+    body {
+        background-color: #f5f7fa;
+        color: #333;
+        line-height: 1.6;
+    }
+
+    /* Sidebar Styles */
+    .sidebar {
+        width: 280px;
+        height: 100vh;
+        position: fixed;
+        background: linear-gradient(135deg, #1a237e, #283593);
+        color: white;
+        padding-top: 20px;
+        box-shadow: 2px 0 15px rgba(0, 0, 0, 0.1);
+        transition: all 0.3s ease;
+        z-index: 1000;
+        overflow-y: auto;
+    }
+
+    .sidebar h2 {
+        text-align: center;
+        margin-bottom: 30px;
+        padding: 0 20px;
+        font-weight: 600;
+        font-size: 24px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        padding-bottom: 15px;
+    }
+
+    .sidebar a {
+        display: flex;
+        align-items: center;
+        color: white;
+        text-decoration: none;
+        padding: 12px 25px;
+        margin: 8px 15px;
+        border-radius: 5px;
+        transition: all 0.2s;
+        font-size: 16px;
+    }
+
+    .sidebar a i {
+        margin-right: 10px;
+        width: 20px;
+        text-align: center;
+    }
+
+    .sidebar a:hover {
+        background: rgba(255, 255, 255, 0.2);
+        transform: translateX(5px);
+    }
+
+    .sidebar a.active {
+        background: rgba(255, 255, 255, 0.3);
+        font-weight: 600;
+    }
+
+    /* Content Area */
+    .content {
+        margin-left: 280px;
+        padding: 30px;
+        transition: all 0.3s ease;
+    }
+
+    .content h2 {
+        color: #1a237e;
+        margin-bottom: 20px;
+        font-size: 28px;
+        font-weight: 600;
+        border-bottom: 2px solid #1a237e;
+        padding-bottom: 10px;
+        display: inline-block;
+    }
+
+    .content h3 {
+        color: #283593;
+        margin: 25px 0 15px 0;
+        font-size: 20px;
+        font-weight: 500;
+    }
+
+    /* Transaction Form Layout */
+    .transaction-container {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 30px;
+    }
+
+    .transaction-info, .product-selection {
+        background: white;
+        padding: 25px;
+        border-radius: 8px;
+        box-shadow: 0 2px 15px rgba(0, 0, 0, 0.05);
+    }
+
+    /* Form Styles */
+    .form-group {
+        margin-bottom: 20px;
+    }
+
+    .form-label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 500;
+        color: #333;
+    }
+
+    .form-control {
+        width: 100%;
+        padding: 12px 15px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-size: 16px;
+        transition: border 0.3s;
+    }
+
+    .form-control:focus {
+        border-color: #1a237e;
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(26, 35, 126, 0.2);
+    }
+
+    .form-row {
+        display: flex;
+        gap: 20px;
+    }
+
+    .form-row .form-group {
+        flex: 1;
+    }
+
+    /* Tabs for Item Categories */
+    .tab-container {
+        margin-bottom: 20px;
+    }
+
+    .tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 15px;
+    }
+
+    .tab-btn {
+        padding: 10px 15px;
+        background: #f0f2f5;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        font-weight: 500;
+        transition: all 0.3s;
+    }
+
+    .tab-btn:hover {
+        background: #e6e9ed;
+    }
+
+    .tab-btn.active {
+        background: #1a237e;
+        color: white;
+    }
+
+    .tab-content {
+        display: none;
+    }
+
+    .tab-content.active {
+        display: block;
+    }
+
+    /* Table Styles */
+    .item-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 20px;
+    }
+
+    .item-table th, .item-table td {
+        padding: 12px 15px;
+        text-align: left;
+        border-bottom: 1px solid #eee;
+    }
+
+    .item-table th {
+        background-color: #f0f2f5;
+        color: #1a237e;
+        font-weight: 600;
+    }
+
+    .item-table tbody tr:hover {
+        background-color: #f8f9fa;
+    }
+
+    .low-stock {
+        background-color: rgba(255, 82, 82, 0.1);
+    }
+
+    .low-stock td {
+        color: #e53935;
+    }
+
+    .item-quantity {
+        width: 100px;
+        text-align: center;
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+    }
+
+    /* Button Styles */
+    .btn {
+        display: inline-block;
+        padding: 12px 24px;
+        background: linear-gradient(135deg, #1a237e, #283593);
+        color: white;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        box-shadow: 0 3px 10px rgba(26, 35, 126, 0.2);
+        transition: all 0.3s;
+    }
+
+    .btn:hover {
+        background: linear-gradient(135deg, #283593, #1a237e);
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(26, 35, 126, 0.3);
+    }
+
+    .btn:active {
+        transform: translateY(0);
+    }
+
+    .btn-full {
+        width: 100%;
+        text-align: center;
+    }
+
+    /* Transaction Summary */
+    .transaction-summary {
+        background: #f0f2f5;
+        padding: 15px;
+        border-radius: 8px;
+        margin-top: 20px;
+    }
+
+    .summary-title {
+        font-weight: 600;
+        margin-bottom: 10px;
+        color: #1a237e;
+    }
+
+    .summary-item {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 5px;
+    }
+
+    .selected-items-list {
+        max-height: 200px;
+        overflow-y: auto;
+        margin-bottom: 10px;
+    }
+
+    .total-price {
+        font-size: 20px;
+        font-weight: 600;
+        color: #1a237e;
+        margin-top: 10px;
+        text-align: right;
+    }
+
+    /* Search Bar */
+    .search-container {
+        margin-bottom: 20px;
+    }
+
+    .search-box {
+        display: flex;
+    }
+
+    .search-input {
+        flex: 1;
+        padding: 12px 15px;
+        border: 1px solid #ddd;
+        border-radius: 5px 0 0 5px;
+        font-size: 16px;
+    }
+
+    .search-btn {
+        padding: 12px 15px;
+        background: #1a237e;
+        color: white;
+        border: none;
+        border-radius: 0 5px 5px 0;
+        cursor: pointer;
+    }
+
+    /* Responsive Design */
+    @media (max-width: 1200px) {
+        .transaction-container {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    @media (max-width: 992px) {
+        .sidebar {
+            width: 250px;
+        }
+        .content {
+            margin-left: 250px;
+        }
+    }
+
+    @media (max-width: 768px) {
+        .sidebar {
+            width: 0;
+            transform: translateX(-100%);
+        }
+        .content {
+            margin-left: 0;
+        }
+        .menu-toggle {
+            display: block;
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            z-index: 1001;
+            background: #1a237e;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            width: 45px;
+            height: 45px;
+            text-align: center;
+            line-height: 45px;
+            font-size: 24px;
+            cursor: pointer;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+        .sidebar.active {
+            width: 250px;
+            transform: translateX(0);
+        }
+        .form-row {
+            flex-direction: column;
+            gap: 0;
+        }
+    }
+</style>
